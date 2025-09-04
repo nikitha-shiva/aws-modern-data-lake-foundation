@@ -289,3 +289,88 @@ def create_spark_session(app_name: str) -> SparkSession:
             .getOrCreate())
 
 def main():
+    """Main ETL execution function"""
+    
+    # Parse job arguments
+    args = getResolvedOptions(sys.argv, [
+        'JOB_NAME',
+        'bronze_path',
+        'silver_path',
+        'partition_columns',
+        'quality_threshold'
+    ])
+    
+    # Initialize contexts
+    spark = create_spark_session(args['JOB_NAME'])
+    sc = spark.sparkContext
+    glueContext = GlueContext(sc)
+    job = Job(glueContext)
+    job.init(args['JOB_NAME'], args)
+    
+    try:
+        logger.info(f"Starting ETL job: {args['JOB_NAME']}")
+        logger.info(f"Bronze path: {args['bronze_path']}")
+        logger.info(f"Silver path: {args['silver_path']}")
+        
+        # Initialize transformer
+        transformer = BronzeToSilverTransformer(spark)
+        
+        # Read bronze data
+        logger.info("Reading bronze data...")
+        bronze_df = (spark.read
+                    .option("multiline", "true")
+                    .option("inferSchema", "true")
+                    .json(args['bronze_path']))
+        
+        initial_count = bronze_df.count()
+        logger.info(f"Read {initial_count} records from bronze layer")
+        
+        if initial_count == 0:
+            logger.warning("No data found in bronze layer")
+            job.commit()
+            return
+        
+        # Parse partition columns
+        partition_columns = (args.get('partition_columns', '').split(',') 
+                           if args.get('partition_columns') else ['year', 'month'])
+        
+        # Transform data
+        silver_df, metadata = transformer.transform(bronze_df, partition_columns)
+        
+        final_count = silver_df.count()
+        logger.info(f"Transformed to {final_count} records for silver layer")
+        
+        # Quality gate check
+        quality_threshold = float(args.get('quality_threshold', '0.85'))
+        if metadata['final_quality']['overall_quality_score'] < quality_threshold:
+            error_msg = f"Data quality ({metadata['final_quality']['overall_quality_score']:.3f}) below threshold ({quality_threshold})"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # Write to silver layer
+        logger.info("Writing data to silver layer...")
+        (silver_df.write
+         .mode("overwrite")
+         .partitionBy(*partition_columns)
+         .option("compression", "snappy")
+         .parquet(args['silver_path']))
+        
+        # Save metadata
+        metadata_path = f"{args['silver_path']}_metadata/transformation_metadata.json"
+        metadata_df = spark.createDataFrame([json.dumps(metadata)], StringType())
+        metadata_df.write.mode("overwrite").text(metadata_path)
+        
+        logger.info("ETL job completed successfully")
+        logger.info(f"Final quality score: {metadata['final_quality']['overall_quality_score']:.3f}")
+        
+        job.commit()
+        
+    except Exception as e:
+        logger.error(f"ETL job failed: {str(e)}")
+        raise e
+    
+    finally:
+        spark.stop()
+
+if __name__ == "__main__":
+    main()
